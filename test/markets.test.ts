@@ -1,7 +1,20 @@
+import Database from 'better-sqlite3';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { createMarket, getMarket, placeBet, pools, respondAsSubject } from '../src/domain/markets.ts';
+import { openDb } from '../src/db.ts';
+import {
+  createMarket,
+  getMarket,
+  marketIdFromUrl,
+  placeBet,
+  pools,
+  publicIdForOldNumber,
+  respondAsSubject,
+} from '../src/domain/markets.ts';
 import { tick } from '../src/domain/tick.ts';
-import { DAY } from '../src/time.ts';
+import { DAY, TIME_ZONES, timeZoneOptions, wallTimeToEpoch, zoneName } from '../src/time.ts';
 import { T0, makeMarket, setup } from './helpers.ts';
 
 describe('creating markets', () => {
@@ -12,6 +25,7 @@ describe('creating markets', () => {
       criteria: 'YES if the Met Office reports snow at the town station.',
       evidenceSource: 'Met Office',
       closeAt: T0 + DAY,
+      timeZone: 'UTC',
       subjectId: null,
     };
     expect(() => createMarket(db, ids[0], { ...input, attestations: ['no_harm', 'no_crime'] }, T0)).toThrow(/checklist/);
@@ -27,7 +41,7 @@ describe('creating markets', () => {
       createMarket(
         db,
         ids[0],
-        { question: 'Loser owes the winner $20?', criteria: 'Self-evident really', evidenceSource: 'Us', closeAt: T0 + DAY, subjectId: null, attestations: ['no_harm', 'no_crime', 'no_minors'] },
+        { question: 'Loser owes the winner $20?', criteria: 'Self-evident really', evidenceSource: 'Us', closeAt: T0 + DAY, timeZone: 'UTC', subjectId: null, attestations: ['no_harm', 'no_crime', 'no_minors'] },
         T0,
       ),
     ).toThrow(/play points/);
@@ -98,5 +112,78 @@ describe('betting', () => {
     const m = makeMarket(db, ids[0]);
     db.prepare('UPDATE users SET is_active = 0 WHERE id = ?').run(ids[1]);
     expect(() => placeBet(db, m, ids[1], 'YES', 10, T0)).toThrow(/not active/);
+  });
+});
+
+describe('time zones', () => {
+  it('turns a wall-clock time in a zone into an instant, across DST changes', () => {
+    expect(wallTimeToEpoch('2026-10-30T17:00', 'Asia/Tokyo')).toBe(Date.UTC(2026, 9, 30, 8));
+    expect(wallTimeToEpoch('2026-10-30T17:00', 'UTC')).toBe(Date.UTC(2026, 9, 30, 17));
+    // New York is on EDT (UTC-4) before Nov 1 2026 and EST (UTC-5) after.
+    expect(wallTimeToEpoch('2026-10-31T12:00', 'America/New_York')).toBe(Date.UTC(2026, 9, 31, 16));
+    expect(wallTimeToEpoch('2026-11-02T12:00', 'America/New_York')).toBe(Date.UTC(2026, 10, 2, 17));
+    expect(wallTimeToEpoch('2026-03-29T12:00', 'Asia/Kolkata')).toBe(Date.UTC(2026, 2, 29, 6, 30));
+    expect(wallTimeToEpoch('not a time', 'UTC')).toBeNaN();
+    expect(wallTimeToEpoch('2026-10-30T17:00', 'Nowhere/Special')).toBeNaN();
+    expect(wallTimeToEpoch('2026-03-29T12:00', 'Asia/Calcutta')).toBeNaN(); // offered under its current name only
+  });
+
+  it('lists each zone once, west to east, with its offset and major cities', () => {
+    const options = timeZoneOptions(T0);
+    expect(options).toHaveLength(TIME_ZONES.length);
+    expect(new Set(options.map((o) => o.zone)).size).toBe(options.length);
+    expect(options[0].label).toBe('UTC−11:00 Samoa Time (Pago Pago, Midway)');
+    expect(options.find((o) => o.zone === 'Europe/Paris')!.label).toBe(
+      'UTC+01:00 Central European Time (Berlin, Paris, Madrid, Rome, Amsterdam, Warsaw)',
+    );
+    expect(options.find((o) => o.zone === 'UTC')!.label).toMatch(/^UTC\+00:00 Coordinated Universal Time/);
+  });
+
+  it('names zones', () => {
+    expect(zoneName('Asia/Tokyo')).toBe('Japan & Korea Time');
+    expect(zoneName('America/Argentina/Buenos_Aires')).toBe('Buenos Aires time'); // not in the list
+  });
+
+  it('requires a known zone and stores it', () => {
+    const { db, ids } = setup(1);
+    expect(getMarket(db, makeMarket(db, ids[0])).timezone).toBe('UTC');
+    expect(() =>
+      createMarket(
+        db,
+        ids[0],
+        { question: 'Will it snow in town before New Year?', criteria: 'YES if the Met Office reports snow.', evidenceSource: 'Met Office', closeAt: T0 + DAY, timeZone: 'Nowhere/Special', subjectId: null, attestations: ['no_harm', 'no_crime', 'no_minors'] },
+        T0,
+      ),
+    ).toThrow(/time zone/);
+  });
+});
+
+describe('migrations', () => {
+  it('adds the time zone column to a database from before market zones', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'arblab-')), 'old.db');
+    const old = new Database(path);
+    old.exec('CREATE TABLE markets (id INTEGER PRIMARY KEY, close_at INTEGER NOT NULL, status TEXT NOT NULL)');
+    old.exec("INSERT INTO markets (close_at, status) VALUES (1, 'open')");
+    old.close();
+    const db = openDb(path);
+    expect(db.prepare('SELECT timezone FROM markets').get()).toEqual({ timezone: null });
+    db.close();
+  });
+});
+
+describe('public ids', () => {
+  it('gives markets in a database from before random ids one, and keeps their number for old links', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'arblab-')), 'old.db');
+    const old = new Database(path);
+    old.exec('CREATE TABLE markets (id INTEGER PRIMARY KEY, close_at INTEGER NOT NULL, status TEXT NOT NULL)');
+    old.exec("INSERT INTO markets (close_at, status) VALUES (1, 'open'), (2, 'open')");
+    old.close();
+    const db = openDb(path);
+    const rows = db.prepare('SELECT id, public_id, old_number FROM markets ORDER BY id').all() as { id: number; public_id: string; old_number: number }[];
+    expect(rows.map((r) => r.old_number)).toEqual([1, 2]);
+    expect(new Set(rows.map((r) => r.public_id)).size).toBe(2);
+    expect(marketIdFromUrl(db, rows[1].public_id)).toBe(2);
+    expect(publicIdForOldNumber(db, 1)).toBe(rows[0].public_id);
+    db.close();
   });
 });

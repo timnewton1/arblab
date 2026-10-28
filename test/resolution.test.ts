@@ -1,13 +1,17 @@
 import { describe, expect, it } from 'vitest';
-import { getMarket, placeBet, respondAsSubject } from '../src/domain/markets.ts';
+import { getMarket, listMarkets, placeBet, respondAsSubject } from '../src/domain/markets.ts';
+import { leaderboard } from '../src/domain/points.ts';
 import {
   type Rng,
   bondFor,
   castVote,
+  deleteMarket,
+  deleteRefusal,
   dispute,
   eligibleJurors,
   getDispute,
   getJurors,
+  juryDuty,
   jurySize,
   propose,
   tally,
@@ -234,5 +238,44 @@ describe('deadline auto-void', () => {
     tick(s.db, CLOSE + 30 * DAY);
     expect(getMarket(s.db, m)).toMatchObject({ status: 'resolved', outcome: 'VOID' });
     expect(s.bal(2)).toBeGreaterThanOrEqual(1000);
+  });
+});
+
+describe('deleting markets', () => {
+  it('lets the creator delete their own market until someone else bets', () => {
+    const s = setup(3);
+    const m = makeMarket(s.db, 1, { closeAt: CLOSE });
+    placeBet(s.db, m, 1, 'YES', 50, T0);
+    expect(deleteRefusal(s.db, m, 2)).toMatch(/creator or an admin/);
+    expect(deleteRefusal(s.db, m, 1)).toBeNull();
+    placeBet(s.db, m, 2, 'NO', 30, T0);
+    expect(() => deleteMarket(s.db, m, 1, T0)).toThrow(/only an admin/);
+  });
+
+  it('lets the admin delete any unresolved market, returning every stake and bond', () => {
+    const s = setup(8);
+    s.db.prepare('UPDATE users SET is_admin = 1 WHERE id = 8').run();
+    const m = makeMarket(s.db, 1, { closeAt: CLOSE });
+    placeBet(s.db, m, 2, 'YES', 100, T0);
+    placeBet(s.db, m, 3, 'NO', 200, T0);
+    tick(s.db, CLOSE);
+    propose(s.db, m, 4, 'YES', 'It happened.', CLOSE);
+    dispute(s.db, m, 5, 'It did not.', CLOSE, () => 0);
+    expect(getMarket(s.db, m).status).toBe('disputed');
+
+    deleteMarket(s.db, m, 8, CLOSE + 1);
+    expect(getMarket(s.db, m)).toMatchObject({ status: 'resolved', outcome: 'VOID', deleted_by: 8 });
+    for (const id of [2, 3, 4, 5]) expect(s.bal(id)).toBe(1000);
+    expect(juryDuty(s.db, 6)).toEqual([]);
+    expect(listMarkets(s.db, 'resolved').map((x) => x.id)).not.toContain(m);
+    expect(leaderboard(s.db, 0).find((r) => r.id === 2)!.markets).toBe(0);
+  });
+
+  it("won't delete a resolved market", () => {
+    const s = setup(3);
+    s.db.prepare('UPDATE users SET is_admin = 1 WHERE id = 3').run();
+    const m = makeMarket(s.db, 1, { closeAt: CLOSE });
+    tick(s.db, CLOSE + 8 * DAY); // voided for want of a proposal
+    expect(() => deleteMarket(s.db, m, 3, CLOSE + 8 * DAY)).toThrow(/resolved/);
   });
 });

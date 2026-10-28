@@ -8,7 +8,7 @@ import {
   WEEKLY_ALLOWANCE,
 } from '../domain/rules.ts';
 import type { Invite, MemberRow } from '../domain/users.ts';
-import { html } from '../html.ts';
+import { type Html, html } from '../html.ts';
 import { APP_NAME, type PageCtx, page, pts, signed, when } from './layout.ts';
 
 export function loginPage(ctx: PageCtx, name = ''): string {
@@ -85,7 +85,7 @@ export function mePage(ctx: PageCtx, positions: Position[], ledger: LedgerRow[])
 ${positions.length
   ? html`<div class="scroll"><table><thead><tr><th>Market</th><th class="num">YES</th><th class="num">NO</th><th>Status</th><th class="num">Result</th></tr></thead><tbody>
     ${positions.map(
-      (p) => html`<tr><td><a href="/markets/${p.id}">${p.question}</a></td><td class="num">${p.yes}</td><td class="num">${p.no}</td>
+      (p) => html`<tr><td><a href="/markets/${p.public_id}">${p.question}</a></td><td class="num">${p.yes}</td><td class="num">${p.no}</td>
         <td>${p.status === 'resolved' ? p.outcome : p.status}</td><td class="num">${p.status === 'resolved' ? signed(p.net) : '–'}</td></tr>`,
     )}</tbody></table></div>`
   : html`<p class="muted">No bets yet.</p>`}
@@ -95,7 +95,7 @@ ${positions.length
 <div class="scroll"><table><thead><tr><th>When</th><th>What</th><th class="num">Change</th><th class="num">Balance</th></tr></thead><tbody>
 ${ledger.map(
   (l) => html`<tr><td>${when(l.created_at, true)}</td>
-    <td>${LEDGER_LABELS[l.type]}${l.market_id ? html`<small><a href="/markets/${l.market_id}">${l.question}</a></small>` : ''}</td>
+    <td>${LEDGER_LABELS[l.type]}${l.market_public_id ? html`<small><a href="/markets/${l.market_public_id}">${l.question}</a></small>` : ''}</td>
     <td class="num">${signed(l.amount)}</td><td class="num">${l.running.toLocaleString('en-US')}</td></tr>`,
 )}</tbody></table></div>
 
@@ -136,15 +136,9 @@ export function membersPage(ctx: PageCtx, members: MemberRow[], invites: Invite[
     html`<h1>Members <small class="muted">${active} / ${MAX_MEMBERS}</small></h1>
 <div class="scroll"><table><thead><tr><th>Name</th><th>Joined</th><th>Invited by</th><th>Status</th>${admin ? html`<th></th>` : ''}</tr></thead><tbody>
 ${members.map(
-  (m) => html`<tr><td>${m.display_name}${m.is_admin ? ' (admin)' : ''}</td><td>${when(m.created_at, true)}</td><td>${m.invited_by_name ?? '–'}</td>
+  (m) => html`<tr><td>${m.display_name}${m.is_owner ? ' (owner)' : m.is_admin ? ' (admin)' : ''}</td><td>${when(m.created_at, true)}</td><td>${m.invited_by_name ?? '–'}</td>
     <td>${m.is_active ? 'Active' : 'Deactivated'}</td>
-    ${admin
-      ? html`<td>${m.id === ctx.viewer!.id
-          ? ''
-          : html`<form method="post" action="/members/${m.id}/${m.is_active ? 'deactivate' : 'reactivate'}">
-              <button class="link">${m.is_active ? 'Deactivate' : 'Reactivate'}</button></form>
-              ${m.is_active ? html`<form method="post" action="/members/${m.id}/reset"><button class="link">Reset link</button></form>` : ''}`}</td>`
-      : ''}</tr>`,
+    ${admin ? html`<td>${memberActions(ctx, m)}</td>` : ''}</tr>`,
 )}</tbody></table></div>
 
 <h2>Invite someone</h2>
@@ -162,6 +156,19 @@ ${invites.length
   );
 }
 
+/** What the viewer (an admin) can do to `m`: the owner manages admins, other admins only members. */
+function memberActions(ctx: PageCtx, m: MemberRow): Html | string {
+  const v = ctx.viewer!;
+  if (m.id === v.id || m.is_owner) return '';
+  const button = (action: string, label: string) =>
+    html`<form method="post" action="/members/${m.id}/${action}"><button class="link">${label}</button></form>`;
+  const mine = !m.is_admin || v.isOwner; // admins are the owner's to manage
+  const active = mine ? button(m.is_active ? 'deactivate' : 'reactivate', m.is_active ? 'Deactivate' : 'Reactivate') : '';
+  const reset = mine && m.is_active ? button('reset', 'Reset link') : '';
+  const role = !v.isOwner ? '' : m.is_admin ? button('remove-admin', 'Remove admin') : m.is_active ? button('make-admin', 'Make admin') : '';
+  return html`${active}${reset}${role}`;
+}
+
 export function rulesPage(ctx: PageCtx): string {
   return page(
     ctx,
@@ -176,7 +183,9 @@ export function rulesPage(ctx: PageCtx): string {
 <h2>Membership</h2>
 <ul>
   <li>Invite-only, 18+ only, at most ${MAX_MEMBERS} active members.</li>
-  <li>Any member can create a single-use invite link. The admin can deactivate members and create password reset links for them (a reset link lets whoever uses it set that member's password), and has no other special powers.</li>
+  <li>Any member can create a single-use invite link. Admins can deactivate members, delete markets that haven't been resolved, and create password reset links for members (a reset link lets whoever uses it set that member's password). They have no other special powers.</li>
+  <li>The owner is an admin who also makes members admins, takes that away, and is the only one who can deactivate an admin
+      or make a reset link for one. Nobody can deactivate or demote the owner.</li>
 </ul>
 
 <h2>Points</h2>

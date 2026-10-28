@@ -1,7 +1,7 @@
 import { randomInt } from 'node:crypto';
 import type { DB } from '../db.ts';
 import { weekStart } from '../time.ts';
-import { finalizeMarket, getMarket, pools, requireActive } from './markets.ts';
+import { betsFor, finalizeMarket, getMarket, pools, requireActive } from './markets.ts';
 import { splitEvenly } from './payout.ts';
 import { credit, debit } from './points.ts';
 import {
@@ -14,12 +14,13 @@ import {
   type Outcome,
   PROPOSAL_DEADLINE,
   QUORUM,
+  RuleError,
   SMALL_GROUP,
   SMALL_JURY_SIZE,
   cleanText,
   rule,
 } from './rules.ts';
-import { activeMemberCount } from './users.ts';
+import { activeMemberCount, getUser } from './users.ts';
 
 /** Returns a uniformly random integer in [0, max). Injectable so tests are deterministic. */
 export type Rng = (max: number) => number;
@@ -222,13 +223,52 @@ export function closeVoting(db: DB, marketId: number, now: number, reason?: stri
 }
 
 /** Open juries this member sits on and hasn't voted in yet. */
-export function juryDuty(db: DB, userId: number): { id: number; question: string; voting_ends_at: number }[] {
+export function juryDuty(db: DB, userId: number): { id: number; public_id: string; question: string; voting_ends_at: number }[] {
   return db
     .prepare(
-      `SELECT m.id, m.question, d.voting_ends_at
+      `SELECT m.id, m.public_id, m.question, d.voting_ends_at
        FROM jurors j JOIN disputes d ON d.market_id = j.market_id JOIN markets m ON m.id = j.market_id
        WHERE j.user_id = ? AND j.vote IS NULL AND d.closed_at IS NULL
        ORDER BY d.voting_ends_at`,
     )
-    .all(userId) as { id: number; question: string; voting_ends_at: number }[];
+    .all(userId) as { id: number; public_id: string; question: string; voting_ends_at: number }[];
+}
+
+/**
+ * Why `userId` can't delete the market, or null if they can. An admin can delete any market that isn't
+ * resolved; its creator only while nobody else has bet on it and no outcome has been proposed. Resolved
+ * markets stay: their points have been paid out.
+ */
+export function deleteRefusal(db: DB, marketId: number, userId: number): string | null {
+  const m = getMarket(db, marketId);
+  const user = getUser(db, userId);
+  if (!user?.is_active) return 'Your account is not active.';
+  if (m.deleted_at !== null) return 'This market has already been deleted.';
+  if (m.status === 'resolved') return "A resolved market can't be deleted: its points have been paid out.";
+  if (user.is_admin) return null;
+  if (m.creator_id !== userId) return 'Only its creator or an admin can delete a market.';
+  if (betsFor(db, marketId).some((b) => b.userId !== userId)) return 'Others have bet on this market, so only an admin can delete it now.';
+  if (m.status === 'proposed' || m.status === 'disputed') return 'An outcome has been proposed, so only an admin can delete it now.';
+  return null;
+}
+
+/** Cancels the market for everyone and hides it: every stake and any bond still held goes back. */
+export function deleteMarket(db: DB, marketId: number, userId: number, now: number): void {
+  const refusal = deleteRefusal(db, marketId, userId);
+  if (refusal) throw new RuleError(refusal);
+  const m = getMarket(db, marketId);
+  const p = getProposal(db, marketId);
+  const d = getDispute(db, marketId);
+  let bonds = false;
+  if (p && (m.status === 'proposed' || m.status === 'disputed')) {
+    credit(db, p.user_id, 'bond_return', p.bond, marketId, now);
+    bonds = true;
+  }
+  if (d && d.closed_at === null) {
+    db.prepare('UPDATE disputes SET closed_at = ? WHERE market_id = ?').run(now, marketId); // the jury is stood down
+    credit(db, d.user_id, 'bond_return', d.bond, marketId, now);
+  }
+  const name = getUser(db, userId)!.display_name;
+  finalizeMarket(db, marketId, 'VOID', `Deleted by ${name}. Every stake${bonds ? ' and bond' : ''} was returned.`, now);
+  db.prepare('UPDATE markets SET deleted_at = ?, deleted_by = ? WHERE id = ?').run(now, userId, marketId);
 }

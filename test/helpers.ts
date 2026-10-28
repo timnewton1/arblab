@@ -33,6 +33,7 @@ export function makeMarket(
       criteria: 'YES if CI on main is green every day until close.',
       evidenceSource: 'The CI dashboard',
       closeAt: opts.closeAt ?? now + DAY,
+      timeZone: 'UTC',
       subjectId: opts.subjectId ?? null,
       attestations: ATTESTATIONS.map((a) => a.key),
     },

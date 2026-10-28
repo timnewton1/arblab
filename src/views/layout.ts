@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import type { MarketListRow } from '../domain/markets.ts';
 import { impliedYes } from '../domain/payout.ts';
 import { type Html, html } from '../html.ts';
-import { formatDuration, formatUtc } from '../time.ts';
+import { formatDuration, formatInZone, formatUtc, timeZoneOptions, zoneName } from '../time.ts';
 
 export const APP_NAME = 'Arblab';
 
@@ -19,6 +19,7 @@ export interface Viewer {
   id: number;
   name: string;
   isAdmin: boolean;
+  isOwner: boolean;
   balance: number;
 }
 
@@ -67,7 +68,9 @@ export function page(ctx: PageCtx, title: string, body: Html): string {
 ${ctx.flash ? html`<p class="flash ${ctx.flash.kind}" role="status">${ctx.flash.message}</p>` : ''}
 ${body}
 </main>
-<footer>Play points only. They have no cash value and cannot be bought, sold, transferred or redeemed. <a href="/rules">House Rules</a></footer>
+<footer>
+<label class="tz" hidden>Show times in <select id="tz"><option value="">Automatic</option>${zoneOptions(ctx.now)}</select></label>
+Play points only. They have no cash value and cannot be bought, sold, transferred or redeemed. <a href="/rules">House Rules</a></footer>
 </body>
 </html>`.value;
 }
@@ -83,6 +86,29 @@ export function signed(n: number): string {
 /** A timestamp; app.js rewrites it in the viewer's time zone (`short` drops the year, for tables). */
 export function when(t: number, short = false): Html {
   return html`<time datetime="${new Date(t).toISOString()}" ${short ? html`data-short` : ''}>${formatUtc(t)}</time>`;
+}
+
+/** The time zone picker's options, west to east; app.js picks the viewer's own where nothing is `selected`. */
+export function zoneOptions(now: number, selected = ''): Html[] {
+  return timeZoneOptions(now).map((o) => html`<option value="${o.zone}" ${o.zone === selected ? 'selected' : ''}>${o.label}</option>`);
+}
+
+/**
+ * A market time: the viewer's own time first, in bold, and underneath it the time where the event is, when
+ * that reads differently (app.js fills in the first and decides the second; without it the first shows the
+ * event's time). Markets from before time zones fall back to `when`. `note` follows the viewer's time.
+ */
+export function zonedWhen(t: number, zone: string | null, short = false, note = ''): Html {
+  const after = note ? html` <span class="muted">· ${note}</span>` : '';
+  if (!zone) return html`${when(t, short)}${after}`;
+  const iso = new Date(t).toISOString();
+  const s = short ? html`data-short` : '';
+  return html`<span class="zoned" data-zoned><time class="yours" datetime="${iso}" ${s}>${formatInZone(t, zone, short)}</time>${after}<span class="event-time" data-event-time hidden>${short ? ' · ' : html`<br>`}<time datetime="${iso}" data-zone="${zone}" ${s}>${formatInZone(t, zone, short, false)}</time> ${zoneName(zone)}</span></span>`;
+}
+
+/** The viewer's current time; app.js keeps it ticking in their chosen time zone. */
+export function clock(now: number): Html {
+  return html`<time datetime="${new Date(now).toISOString()}" data-clock>${formatUtc(now)}</time>`;
 }
 
 export function until(t: number, now: number): string {
@@ -109,6 +135,7 @@ export function statusLine(m: MarketListRow, now: number): Html {
     case 'disputed':
       return html`<span class="tag wait">Disputed</span> jury voting`;
     case 'resolved':
+      if (m.deleted_at !== null) return html`<span class="tag">Deleted</span>`;
       return html`<span class="tag ${m.outcome?.toLowerCase()}">Resolved ${m.outcome}</span>`;
   }
 }
@@ -126,8 +153,8 @@ export function marketList(rows: MarketListRow[], now: number, empty: string): H
   if (rows.length === 0) return html`<p class="muted">${empty}</p>`;
   return html`<ul class="markets">${rows.map(
     (m) => html`<li>
-  <a href="/markets/${m.id}">${m.question}</a>
-  <div class="meta">${statusLine(m, now)}${m.subject_name ? html` · about ${m.subject_name}` : ''} · pool ${pts(m.yes_pool + m.no_pool)}</div>
+  <a href="/markets/${m.public_id}">${m.question}</a>
+  <div class="meta">${statusLine(m, now)}${m.status === 'open' || m.status === 'pending' ? html` (${zonedWhen(m.close_at, m.timezone, true)})` : ''}${m.subject_name ? html` · about ${m.subject_name}` : ''} · pool ${pts(m.yes_pool + m.no_pool)}</div>
   ${m.status === 'resolved' ? '' : poolBar(m.yes_pool, m.no_pool)}
 </li>`,
   )}</ul>`;

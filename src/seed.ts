@@ -8,12 +8,12 @@ import { DAY, HOUR } from './time.ts';
 
 export const DEMO_NAMES = ['Alice', 'Bob', 'Carol', 'Dev', 'Erin', 'Femi'];
 
-/** Six members (Alice is admin) and three markets: open, open with a subject, and awaiting resolution. */
+/** Six members (Alice is the owner) and three markets: open, open with a subject, and awaiting resolution. */
 export function seedDemo(db: DB, now: number, passwordHash: string): void {
   db.transaction(() => {
     const joined = now - 3 * DAY;
     const [alice, bob, carol, dev, erin, femi] = DEMO_NAMES.map((name, i) =>
-      createUser(db, { name, passwordHash, isAdmin: i === 0, adult: true }, joined),
+      createUser(db, { name, passwordHash, isOwner: i === 0, adult: true }, joined),
     );
     const attestations = ATTESTATIONS.map((a) => a.key);
 
@@ -26,6 +26,7 @@ export function seedDemo(db: DB, now: number, passwordHash: string): void {
         criteria: 'YES if accommodation for the trip is booked and the confirmation is shared in the group chat before trading closes.',
         evidenceSource: 'Booking confirmation in the group chat',
         closeAt: now - 2 * HOUR,
+        timeZone: 'UTC',
         subjectId: null,
         attestations,
       },
@@ -45,6 +46,7 @@ export function seedDemo(db: DB, now: number, passwordHash: string): void {
         criteria: "YES if Bob's official chip time in the published results is under 50:00. NO if slower or he doesn't start.",
         evidenceSource: 'Official race results page',
         closeAt: now + 10 * DAY,
+        timeZone: 'America/New_York',
         subjectId: bob,
         attestations,
       },
@@ -60,6 +62,7 @@ export function seedDemo(db: DB, now: number, passwordHash: string): void {
         criteria: 'YES if Met Office daily observations for Edinburgh record any snowfall between market creation and close.',
         evidenceSource: 'https://www.metoffice.gov.uk/',
         closeAt: now + 20 * DAY,
+        timeZone: 'Europe/London',
         subjectId: null,
         attestations,
       },

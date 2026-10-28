@@ -80,6 +80,7 @@ export interface LedgerRow {
   type: LedgerType;
   amount: number;
   market_id: number | null;
+  market_public_id: string | null;
   question: string | null;
   created_at: number;
   running: number;
@@ -89,7 +90,7 @@ export function ledgerFor(db: DB, userId: number, limit = 200): LedgerRow[] {
   return db
     .prepare(
       `SELECT * FROM (
-         SELECT l.id, l.type, l.amount, l.market_id, m.question, l.created_at,
+         SELECT l.id, l.type, l.amount, l.market_id, m.public_id AS market_public_id, m.question, l.created_at,
                 SUM(l.amount) OVER (ORDER BY l.id) AS running
          FROM ledger l LEFT JOIN markets m ON m.id = l.market_id
          WHERE l.user_id = ?
@@ -116,7 +117,7 @@ export function leaderboard(db: DB, since: number): LeaderRow[] {
               (SELECT COALESCE(SUM(amount), 0) FROM ledger WHERE user_id = u.id) AS balance
        FROM users u
        LEFT JOIN ledger l ON l.user_id = u.id AND l.type <> 'allowance'
-         AND l.market_id IN (SELECT id FROM markets WHERE status = 'resolved' AND resolved_at >= ?)
+         AND l.market_id IN (SELECT id FROM markets WHERE status = 'resolved' AND resolved_at >= ? AND deleted_at IS NULL)
        WHERE u.is_active = 1
        GROUP BY u.id
        ORDER BY net DESC, markets DESC, u.display_name`,

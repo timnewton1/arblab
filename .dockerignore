@@ -3,3 +3,9 @@ data
 test
 .git
 *.db
+.env
+.env.*
+compose.yaml
+deploy
+fly.toml
+*.md

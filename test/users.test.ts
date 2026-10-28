@@ -1,3 +1,7 @@
+import Database from 'better-sqlite3';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { openDb } from '../src/db.ts';
 import { MAX_MEMBERS } from '../src/domain/rules.ts';
@@ -9,6 +13,8 @@ import {
   redeemInvite,
   redeemPasswordReset,
   setActive,
+  setAdmin,
+  setOwner,
   usableReset,
 } from '../src/domain/users.ts';
 import { DAY, HOUR } from '../src/time.ts';
@@ -76,7 +82,7 @@ describe('admin', () => {
     const admin = addUser(db, 'Admin');
     const bob = addUser(db, 'Bob');
     db.prepare('UPDATE users SET is_admin = 1 WHERE id = ?').run(admin);
-    expect(() => setActive(db, bob, admin, false)).toThrow(/Only the admin/);
+    expect(() => setActive(db, bob, admin, false)).toThrow(/Only an admin/);
     expect(() => setActive(db, admin, admin, false)).toThrow(/yourself/);
   });
 });
@@ -119,5 +125,70 @@ describe('password reset links', () => {
     expect(() => createPasswordReset(db, ids[0], ids[1], T0)).not.toThrow();
     setActive(db, ids[0], ids[1], false);
     expect(() => createPasswordReset(db, ids[0], ids[1], T0)).toThrow(/active/);
+  });
+});
+
+describe('the owner and admins', () => {
+  /** User1 owns the group, User2 is an admin, User3 and User4 are members. */
+  function group() {
+    const g = setup(4);
+    g.db.prepare('UPDATE users SET is_owner = 1, is_admin = 1 WHERE id = ?').run(g.ids[0]);
+    g.db.prepare('UPDATE users SET is_admin = 1 WHERE id = ?').run(g.ids[1]);
+    return { db: g.db, owner: g.ids[0], admin: g.ids[1], cara: g.ids[2], dan: g.ids[3] };
+  }
+
+  it('only the owner appoints and removes admins', () => {
+    const { db, owner, admin, cara } = group();
+    expect(() => setAdmin(db, admin, cara, true)).toThrow(/Only the owner/);
+    setAdmin(db, owner, cara, true);
+    expect(getUser(db, cara)!.is_admin).toBe(1);
+    setAdmin(db, owner, cara, false);
+    expect(getUser(db, cara)!.is_admin).toBe(0);
+    expect(() => setAdmin(db, owner, owner, false)).toThrow(/always an admin/);
+  });
+
+  it('stops an admin taking over: they can deactivate members, but not admins or the owner', () => {
+    const { db, owner, admin, cara, dan } = group();
+    setAdmin(db, owner, cara, true);
+    expect(() => setActive(db, admin, cara, false)).toThrow(/Only the owner can deactivate an admin/);
+    expect(() => setActive(db, admin, owner, false)).toThrow(/owner cannot be deactivated/);
+    expect(() => setAdmin(db, admin, owner, false)).toThrow(/Only the owner/);
+    setActive(db, admin, dan, false);
+    expect(getUser(db, dan)!.is_active).toBe(0);
+    setActive(db, owner, cara, false); // the owner can
+    expect(() => setAdmin(db, owner, cara, true)).toThrow(/active/);
+  });
+
+  it("stops an admin taking over through reset links: none for the owner, and only the owner's for admins", () => {
+    const { db, owner, admin, cara } = group();
+    expect(() => createPasswordReset(db, admin, owner, T0)).toThrow(/only be reset on the server/);
+    expect(() => createPasswordReset(db, owner, owner, T0)).toThrow(/only be reset on the server/);
+    setAdmin(db, owner, cara, true);
+    expect(() => createPasswordReset(db, admin, cara, T0)).toThrow(/Only the owner can reset an admin/);
+    expect(createPasswordReset(db, owner, cara, T0).token).toBeTruthy();
+  });
+
+  it('hands ownership over from the server, keeping the old owner an admin', () => {
+    const { db, owner, cara } = group();
+    setOwner(db, cara);
+    expect(getUser(db, cara)).toMatchObject({ is_owner: 1, is_admin: 1 });
+    expect(getUser(db, owner)).toMatchObject({ is_owner: 0, is_admin: 1 });
+    expect(() => db.prepare('UPDATE users SET is_owner = 1 WHERE id = ?').run(owner)).toThrow(/UNIQUE/); // only ever one
+  });
+
+  it('makes the longest-standing admin of a group from before owners the owner', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'arblab-')), 'old.db');
+    const old = new Database(path);
+    old.exec(`CREATE TABLE users (id INTEGER PRIMARY KEY, display_name TEXT NOT NULL UNIQUE COLLATE NOCASE, password_hash TEXT NOT NULL,
+      is_admin INTEGER NOT NULL DEFAULT 0, is_active INTEGER NOT NULL DEFAULT 1, adult_confirmed_at INTEGER NOT NULL,
+      invited_by INTEGER REFERENCES users(id), session_version INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)`);
+    old.exec("INSERT INTO users (display_name, password_hash, is_admin, adult_confirmed_at, created_at) VALUES ('Ann', 'h', 1, 1, 1), ('Bea', 'h', 0, 1, 2)");
+    old.close();
+    const db = openDb(path);
+    expect(db.prepare('SELECT display_name, is_owner FROM users ORDER BY id').all()).toEqual([
+      { display_name: 'Ann', is_owner: 1 },
+      { display_name: 'Bea', is_owner: 0 },
+    ]);
+    db.close();
   });
 });

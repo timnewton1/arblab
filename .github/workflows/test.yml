@@ -1,0 +1,24 @@
+# Type-checks and runs the tests on every push and pull request.
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22.x # Node runs the TypeScript directly; package.json needs 22.18 or newer
+          cache: npm
+      # better-sqlite3 ships its prebuilt binary; --ignore-scripts skips a needless node-gyp rebuild (as in the Dockerfile).
+      - run: npm ci --ignore-scripts
+      - run: npm run typecheck
+      - run: npm test

@@ -1,5 +1,7 @@
 # Arblab
 
+[![Tests](https://github.com/ConnorMilligan/arblab/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/ConnorMilligan/arblab/actions/workflows/test.yml)
+
 A small, invite-only prediction market for a group of friends (up to 50). Members bet
 **play points** on yes/no questions, resolve them with a bonded propose/dispute/jury
 process, and compare results on a leaderboard.
@@ -10,78 +12,96 @@ out, and real-money side bets are not part of the app.
 One Node process, one SQLite file, server-rendered HTML, one CSS file, no client framework
 and no build step. The design and the rule interpretations are in [PLAN.md](PLAN.md).
 
-## Run locally
+## Run with Docker
 
-Needs Node 22.18 or newer (Node runs the TypeScript directly).
-
-```sh
-npm install
-npm run cli -- seed-demo        # 6 demo members (password "demo-password", Alice is admin) + 3 markets
-npm run dev                     # http://localhost:3000
-```
-
-For a real group, start with an empty database and create the first member instead of seeding:
+Needs Docker with the Compose plugin. Everything runs in one container, and the SQLite file lives
+on the `arblab-data` volume.
 
 ```sh
-npm run cli -- create-admin YourName --adult    # prints a generated password (or set ADMIN_PASSWORD)
+cp .env.example .env
+sed -i "s/^SESSION_SECRET=.*/SESSION_SECRET=$(openssl rand -hex 32)/" .env
+docker compose up -d --build                                          # http://localhost:8080
+docker compose exec arblab node src/cli.ts create-admin YourName --adult  # prints a generated password
 ```
 
-Everyone else joins through single-use invite links from the Members page.
+Everyone else joins through single-use invite links from the Members page. To try it with demo data
+instead, run `docker compose exec arblab node src/cli.ts seed-demo` on an empty database
+(6 members, password "demo-password", Alice is the owner, plus 3 markets).
+
+To update after pulling new code: `docker compose up -d --build`. The volume keeps the data.
 
 ## Commands
 
+Run these inside the container: `docker compose exec arblab node src/cli.ts <command>`.
+
 | Command | What it does |
 | --- | --- |
-| `npm run dev` / `npm start` | Run the server (`dev` restarts on file changes) |
-| `npm test` | Run the vitest suite |
-| `npm run typecheck` | `tsc --noEmit` |
-| `npm run cli -- create-admin <name> --adult` | Create the first member (admin). Only works on an empty database. |
-| `npm run cli -- reset-password <name>` | Print a new password for a member. For the admin's own forgotten password, or when the web portal isn't an option. |
-| `npm run cli -- seed-demo` | Fill an empty database with demo data |
-| `npm run cli -- backup <file>` | Write a consistent copy of the database |
+| `create-admin <name> --adult` | Create the first member, the owner. Only works on an empty database. Set `ADMIN_PASSWORD` to choose the password. |
+| `reset-password <name>` | Print a new password for a member. For the owner's own forgotten password, or when the web portal isn't an option. |
+| `set-owner <name>` | Hand ownership to another member. The owner appoints and removes admins; the previous owner stays an admin. |
+| `seed-demo` | Fill an empty database with demo data |
+| `backup <file>` | Write a consistent copy of the database |
 
-Inside the Docker image, run the CLI as `node src/cli.ts <command>`.
+Other useful ones: `docker compose logs -f` to follow the log, `docker compose ps` for the health status.
 
 ## Configuration
 
+Set these in `.env`; `compose.yaml` passes them through.
+
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `SESSION_SECRET` | random per start (dev only) | **Required in production**, at least 32 characters: `openssl rand -hex 32` |
-| `DATABASE_PATH` | `data/arblab.db` | `/data/arblab.db` in the Docker image |
-| `PORT` | `3000` | `8080` in the Docker image |
-| `APP_URL` | from the request | Public base URL used in invite links, e.g. `https://arblab.fly.dev` |
-| `NODE_ENV` | | `production` makes cookies `Secure` (HTTPS only) and requires `SESSION_SECRET` |
+| `SESSION_SECRET` | | **Required**, at least 32 characters: `openssl rand -hex 32` |
+| `APP_URL` | from the request | Public base URL used in invite links, e.g. `https://arblab.example.com` |
+| `ARBLAB_BIND` | `127.0.0.1` | Host address to publish on. `0.0.0.0` exposes it to the network. |
+| `ARBLAB_PORT` | `8080` | Host port to publish on |
+| `SECURE_COOKIES` | `true` in the image | Cookies are HTTPS-only. Set `false` only to serve plain HTTP to other devices (e.g. `http://192.168.1.20:8080` at home). `localhost` works either way. |
+
+The image also sets `NODE_ENV=production`, `PORT=8080` and `DATABASE_PATH=/data/arblab.db`.
 
 ## Deploy
 
-The app is one container with a persistent volume at `/data` for the SQLite file. Run exactly
-one instance: SQLite is a single file on a single disk.
+Run exactly one container: SQLite is a single file on a single disk.
 
-### Fly.io
-
-```sh
-# Set a unique `app` name in fly.toml first.
-fly launch --copy-config --no-deploy
-fly volumes create arblab_data --size 1 --region lhr     # same region as primary_region
-fly secrets set SESSION_SECRET=$(openssl rand -hex 32)
-fly deploy
-fly ssh console -C "node src/cli.ts create-admin YourName --adult"
-```
-
-`fly.toml` keeps one machine running so the deadline check keeps ticking. Deadlines
-are also applied on every request, so nothing is missed if the machine sleeps.
-
-### Railway
-
-1. Create a project from this repo. Railway builds the `Dockerfile`.
-2. Add a volume mounted at `/data`.
-3. Set `SESSION_SECRET` (and optionally `APP_URL`). Railway supplies `PORT`.
-4. Open a shell on the service (`railway ssh`) and run `node src/cli.ts create-admin YourName --adult`.
+On your own server, use the same `docker compose up -d --build`, keep `ARBLAB_BIND=127.0.0.1`, and
+put a reverse proxy that handles HTTPS (Caddy, nginx, Traefik) in front of port 8080. The container
+has a built-in health check on `/healthz`, a read-only filesystem apart from `/data` and `/tmp`, and
+no Linux capabilities.
 
 ### Backups
 
-All state is in one file. Run `node src/cli.ts backup /data/backup-$(date +%F).db` on the
-server and copy the file off (for example with `fly ssh sftp get`).
+All state is in one file. Write a copy into the volume, then copy it out of the container:
+
+```sh
+docker compose exec arblab node src/cli.ts backup /data/backup.db
+docker compose cp arblab:/data/backup.db ./arblab-$(date +%F).db
+```
+
+### Other hosts
+
+The same `Dockerfile` works anywhere that runs containers with a persistent volume at `/data`:
+
+- **Fly.io**: set a unique `app` in `fly.toml`, then `fly launch --copy-config --no-deploy`,
+  `fly volumes create arblab_data --size 1 --region lhr`, `fly secrets set SESSION_SECRET=$(openssl rand -hex 32)`,
+  `fly deploy`, and `fly ssh console -C "node src/cli.ts create-admin YourName --adult"`.
+- **Railway**: create a project from this repo, add a volume at `/data`, set `SESSION_SECRET`, then
+  `railway ssh` and run `node src/cli.ts create-admin YourName --adult`.
+- **Podman + systemd**: `deploy/arblab.container` and `deploy/arblab.network` are Quadlet units;
+  `deploy/update.sh` rebuilds and restarts them.
+
+## Development
+
+Needs Node 22.18 or newer (Node runs the TypeScript directly, no build step).
+
+```sh
+npm install
+npm run cli -- seed-demo   # demo data in data/arblab.db
+npm run dev                # http://localhost:3000, restarts on file changes
+npm test                   # vitest
+npm run typecheck          # tsc --noEmit
+```
+
+Outside Docker the defaults are `PORT=3000`, `DATABASE_PATH=data/arblab.db`, and a random
+`SESSION_SECRET` per start unless `NODE_ENV=production`.
 
 ## How it works
 
@@ -98,7 +118,7 @@ src/domain/          every rule, as plain functions taking (db, ..., now)
   resolution.ts      proposals, disputes, jury draw, voting, bond forfeiture
   tick.ts            applies every deadline that has passed; safe to run repeatedly
 src/views/           HTML templates (tagged template literals with auto-escaping)
-public/              style.css (130 lines), app.js (local times, close-time input)
+public/              style.css, app.js (time zone pickers, local times, live clocks)
 test/                vitest: domain rules plus HTTP tests against the real app
 ```
 
@@ -149,18 +169,25 @@ The spec left a few things open. These are the choices made (more detail in PLAN
   no self-service password reset. A member who forgot their password asks the admin, who clicks
   "Reset link" next to their name on the Members page and sends them the link privately. The link works
   once, expires after an hour, is stored only as a hash, replaces any earlier link, and ends the
-  member's sessions when used. The admin's own password is reset with the `reset-password` CLI command.
+  member's sessions when used. Only the owner can make one for an admin, and the owner's own password is
+  reset with the `reset-password` CLI command.
 - Login rate limiting counts failures in memory over 15 minutes: 5 per name from one client address, 20 per address, and 30 per name overall. The address comes from `X-Forwarded-For` when the request comes from the host-side proxy, and from `Cf-Connecting-Ip` otherwise. There is no global cap, so one client cannot pause logins for everyone. A restart clears the counts.
 - Sessions are server-side rows: logging out, changing a password or deactivating a member revokes them.
-- Markets and bets can't be edited, cancelled or deleted once created. No comments or discussion.
+- Markets and bets can't be edited once created. No comments or discussion. A market's creator can delete
+  it while nobody else has bet and no outcome has been proposed; an admin can delete any market that isn't
+  resolved. Deleting voids it, returns every stake and bond, and hides it from the lists and leaderboard.
 - No pagination. Lists show up to 200 rows.
 - No migration tool. The schema is `CREATE TABLE IF NOT EXISTS`, so a future schema change needs a
   small migration step.
 - If the server is down over several Mondays, only the current week's allowance is granted when it
   comes back; missed weeks aren't paid retroactively.
-- Times render in UTC on the server and switch to local time in the browser. Without JavaScript,
-  the close-time input is read as UTC.
+- Times render in UTC on the server and switch to the viewer's time zone in the browser. That is the
+  device's zone unless they pick another from the footer; the choice is saved per browser (not per
+  account). Each market has its own zone, chosen when it's created: its times show in the viewer's zone
+  first, with the market's local time underneath when that differs. Without JavaScript, times stay UTC
+  and a new market's zone starts on UTC.
 - The "no money talk" check on member-written text is a regex (currency symbols plus a short word
   list), not a moderation system.
 - CSRF protection is `SameSite=Lax` cookies plus an `Origin` check, not per-form tokens.
-- The container runs as root so it can write to a freshly mounted volume without extra setup.
+- The container runs as root so it can write to a freshly mounted volume without extra setup;
+  `compose.yaml` drops all capabilities and makes the rest of the filesystem read-only.

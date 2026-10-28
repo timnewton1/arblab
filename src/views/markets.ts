@@ -3,7 +3,7 @@ import type { Dispute, Juror, Proposal } from '../domain/resolution.ts';
 import { ATTESTATIONS, DISPUTES_PER_WEEK, PROPOSAL_DEADLINE, QUORUM } from '../domain/rules.ts';
 import type { MemberRow } from '../domain/users.ts';
 import { type Html, html } from '../html.ts';
-import { type PageCtx, linkify, marketList, outcomeRadios, page, poolBar, pts, signed, statusLine, until, when } from './layout.ts';
+import { type PageCtx, clock, linkify, marketList, outcomeRadios, page, poolBar, pts, signed, statusLine, until, when, zoneOptions, zonedWhen } from './layout.ts';
 
 const GROUPS: { key: MarketGroup; label: string; empty: string }[] = [
   { key: 'open', label: 'Open', empty: 'No open markets. Start one!' },
@@ -25,6 +25,7 @@ export function marketsPage(ctx: PageCtx, group: MarketGroup, rows: MarketListRo
       ? html`<section class="notice"><h2>Needs you</h2><ul>${todo.map((t) => html`<li><a href="${t.href}">${t.text}</a></li>`)}</ul></section>`
       : ''}
 <div class="row"><h1>Markets</h1><a class="button" href="/markets/new">New market</a></div>
+<p class="muted">Your time: ${clock(ctx.now)}</p>
 <nav class="tabs">${GROUPS.map(
       (g) => html`<a href="/?tab=${g.key}" ${g.key === group ? html`aria-current="page"` : ''}>${g.label}</a>`,
     )}</nav>
@@ -37,6 +38,7 @@ export interface NewMarketValues {
   criteria?: string;
   evidence_source?: string;
   close_local?: string;
+  timezone?: string;
   subject_id?: string;
 }
 
@@ -55,10 +57,14 @@ export function newMarketPage(ctx: PageCtx, members: MemberRow[], values: NewMar
   <label>Evidence source <small>Where the group will check: a link, a public record, a named person.</small>
     <input name="evidence_source" required minlength="3" maxlength="300" value="${values.evidence_source ?? ''}">
   </label>
-  <label>Trading closes <small>Your local time. No bets after this.</small>
-    <input type="datetime-local" name="close_local" required value="${values.close_local ?? ''}" data-epoch="close_at_ms">
-    <input type="hidden" name="close_at_ms">
-  </label>
+  <div class="pair">
+    <label>Trading closes <small>No bets after this.</small>
+      <input type="datetime-local" name="close_local" required value="${values.close_local ?? ''}">
+    </label>
+    <label>Time zone <small>Where the event happens. The close time is read in this zone.</small>
+      ${timeZoneSelect(ctx.now, values.timezone)}
+    </label>
+  </div>
   <label>Subject (optional) <small>If the market is about a member, name them. It stays pending until they opt in, and they can never bet on it.</small>
     <select name="subject_id">
       <option value="">Nobody in particular</option>
@@ -79,6 +85,11 @@ export function newMarketPage(ctx: PageCtx, members: MemberRow[], values: NewMar
   );
 }
 
+/** Without a value (a fresh form), app.js preselects the viewer's own zone; without JS it stays on UTC. */
+function timeZoneSelect(now: number, value: string | undefined): Html {
+  return html`<select name="timezone" required ${value ? '' : html`data-viewer-zone`}>${zoneOptions(now, value || 'UTC')}</select>`;
+}
+
 export interface MarketPageData {
   m: MarketListRow;
   bets: BetListRow[];
@@ -91,6 +102,8 @@ export interface MarketPageData {
   disputesLeft: number;
   eligibleIfIDispute: number;
   jurySize: number;
+  canDelete: boolean;
+  deletedBy: string | null;
 }
 
 export function marketPage(ctx: PageCtx, d: MarketPageData): string {
@@ -102,7 +115,10 @@ export function marketPage(ctx: PageCtx, d: MarketPageData): string {
     ctx,
     m.question,
     html`<article class="market">
-<p class="muted">Market #${m.id} · created by ${m.creator_name} ${when(m.created_at)}</p>
+<p class="muted">Created by ${m.creator_name} ${when(m.created_at)}</p>
+${m.deleted_at !== null
+  ? html`<p class="notice">${d.deletedBy} deleted this market ${when(m.deleted_at)}. Every stake and bond was returned, and it no longer appears in the lists.</p>`
+  : ''}
 <h1>${m.question}</h1>
 <p>${statusLine(m, ctx.now)}</p>
 <dl>
@@ -111,7 +127,8 @@ export function marketPage(ctx: PageCtx, d: MarketPageData): string {
     : ''}
   <dt>Resolution criteria</dt><dd class="pre">${m.criteria}</dd>
   <dt>Evidence source</dt><dd>${linkify(m.evidence_source)}</dd>
-  <dt>Trading ${m.close_at > ctx.now ? 'closes' : 'closed'}</dt><dd>${when(m.close_at)}</dd>
+  <dt>Trading ${m.close_at > ctx.now ? 'closes' : 'closed'}</dt><dd>${zonedWhen(m.close_at, m.timezone, false, m.close_at > ctx.now ? `in ${until(m.close_at, ctx.now)}` : '')}</dd>
+  ${m.close_at > ctx.now ? html`<dt>Your time now</dt><dd>${clock(ctx.now)}</dd>` : ''}
 </dl>
 
 <section>
@@ -140,6 +157,8 @@ ${actionSection(ctx, d, isSubject)}
     : html`<p class="muted">No bets yet.</p>`}
 </section>
 
+${d.canDelete ? deleteSection(d) : ''}
+
 <details>
   <summary>Creator's checklist</summary>
   <p>${m.creator_name} confirmed at ${when(m.attested_at)} that this market:</p>
@@ -147,6 +166,21 @@ ${actionSection(ctx, d, isSubject)}
 </details>
 </article>`,
   );
+}
+
+/** Folded away, and the box must be ticked, so a market isn't deleted by a stray click. */
+function deleteSection(d: MarketPageData): Html {
+  const { m } = d;
+  const others = d.bets.length > 0;
+  return html`<details class="danger">
+  <summary>Delete this market</summary>
+  <p>Deleting cancels it for everyone${others ? ': every stake goes back to whoever placed it' : ''}${d.proposal ? ', and any bond still held is returned' : ''}.
+     It disappears from the lists. This can't be undone.</p>
+  <form method="post" action="/markets/${m.public_id}/delete" class="stack narrow">
+    <label class="check"><input type="checkbox" name="confirm" value="yes" required> Yes, delete this market</label>
+    <button class="secondary">Delete market</button>
+  </form>
+</details>`;
 }
 
 function ratio(total: number, side: number): string {
@@ -163,7 +197,7 @@ function actionSection(ctx: PageCtx, d: MarketPageData, isSubject: boolean): Htm
   <h2>This market is about you</h2>
   <p>${m.creator_name} wants to run this market with you as its subject. If you opt in, members can bet on it. You never can.
      If you decline, the market is cancelled. Nobody has bet yet.</p>
-  <form method="post" action="/markets/${m.id}/subject" class="inline">
+  <form method="post" action="/markets/${m.public_id}/subject" class="inline">
     <button name="answer" value="accept">Opt in</button>
     <button name="answer" value="decline" class="secondary">Decline</button>
   </form>
@@ -174,7 +208,7 @@ function actionSection(ctx: PageCtx, d: MarketPageData, isSubject: boolean): Htm
       if (isSubject) return html`<p class="notice">You are the subject of this market, so you cannot bet on it.</p>`;
       return html`<section>
   <h2>Place a bet</h2>
-  <form method="post" action="/markets/${m.id}/bet" class="stack">
+  <form method="post" action="/markets/${m.public_id}/bet" class="stack">
     ${outcomeRadios('side', ['YES', 'NO'])}
     <label>Points <input type="number" name="amount" min="1" max="${d.balance}" step="1" required inputmode="numeric"></label>
     <button>Place bet</button>
@@ -188,7 +222,7 @@ function actionSection(ctx: PageCtx, d: MarketPageData, isSubject: boolean): Htm
   <p>Trading has closed. Any member can propose the outcome by posting a bond of <b>${pts(d.bond)}</b>
      (10% of the pool, at least 50). If nobody disputes it within 24 hours, it stands and the bond comes back.
      If nobody proposes by ${when(m.close_at + PROPOSAL_DEADLINE)}, the market is voided and every stake refunded.</p>
-  <form method="post" action="/markets/${m.id}/propose" class="stack">
+  <form method="post" action="/markets/${m.public_id}/propose" class="stack">
     ${outcomeRadios('outcome', ['YES', 'NO', 'VOID'])}
     <label>Evidence note <small>What happened, and where you checked.</small>
       <textarea name="note" required minlength="5" maxlength="1000" rows="3"></textarea></label>
@@ -211,7 +245,7 @@ function actionSection(ctx: PageCtx, d: MarketPageData, isSubject: boolean): Htm
     ? html`<p class="flash error">Only ${d.eligibleIfIDispute} member${d.eligibleIfIDispute === 1 ? ' is' : 's are'} free to sit on a jury here,
         so a dispute would void the market and return both bonds.</p>`
     : ''}
-  <form method="post" action="/markets/${m.id}/dispute" class="stack">
+  <form method="post" action="/markets/${m.public_id}/dispute" class="stack">
     <label>Why it's wrong <textarea name="note" required minlength="5" maxlength="1000" rows="3"></textarea></label>
     <button>Post ${pts(p.bond)} bond and dispute</button>
   </form>
@@ -226,7 +260,7 @@ function actionSection(ctx: PageCtx, d: MarketPageData, isSubject: boolean): Htm
   <h2>You're on the jury</h2>
   <p>Read the criteria, evidence source and both notes, then vote. Your vote is final and hidden until voting closes.
      At least ${QUORUM} votes and a 2/3 majority decide. Jurors in the majority share the losing bond.</p>
-  <form method="post" action="/markets/${m.id}/vote" class="stack">
+  <form method="post" action="/markets/${m.public_id}/vote" class="stack">
     ${outcomeRadios('vote', ['YES', 'NO', 'VOID'])}
     <button>Cast vote</button>
   </form>

@@ -8,6 +8,8 @@ export interface User {
   display_name: string;
   password_hash: string;
   is_admin: number;
+  /** The owner is also an admin, and the only one who can appoint, remove or deactivate admins. */
+  is_owner: number;
   is_active: number;
   session_version: number;
   created_at: number;
@@ -51,7 +53,8 @@ export function validatePassword(pw: string): void {
 /** Inserts a member, enforcing the cap, and grants this week's allowance. Call inside a transaction. */
 export function createUser(
   db: DB,
-  opts: { name: string; passwordHash: string; isAdmin?: boolean; invitedBy?: number | null; adult: boolean },
+  /** `isOwner` makes them the owner (and an admin): the first member, from create-admin. */
+  opts: { name: string; passwordHash: string; isAdmin?: boolean; isOwner?: boolean; invitedBy?: number | null; adult: boolean },
   now: number,
 ): number {
   const name = validateDisplayName(opts.name);
@@ -60,10 +63,10 @@ export function createUser(
   rule(!getUserByName(db, name), 'That display name is taken.');
   const res = db
     .prepare(
-      `INSERT INTO users (display_name, password_hash, is_admin, adult_confirmed_at, invited_by, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO users (display_name, password_hash, is_admin, is_owner, adult_confirmed_at, invited_by, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
     )
-    .run(name, opts.passwordHash, opts.isAdmin ? 1 : 0, now, opts.invitedBy ?? null, now);
+    .run(name, opts.passwordHash, opts.isAdmin || opts.isOwner ? 1 : 0, opts.isOwner ? 1 : 0, now, opts.invitedBy ?? null, now);
   const id = Number(res.lastInsertRowid);
   grantWeeklyAllowance(db, id, now);
   return id;
@@ -124,11 +127,15 @@ export function openInvites(db: DB, userId: number, now: number): Invite[] {
     .all(userId, now) as Invite[];
 }
 
+/** Admins deactivate members; only the owner deactivates admins, and nobody deactivates the owner. */
 export function setActive(db: DB, actorId: number, targetId: number, active: boolean): void {
-  rule(getUser(db, actorId)?.is_admin, 'Only the admin can do that.');
+  const actor = getUser(db, actorId);
+  rule(actor?.is_admin, 'Only an admin can do that.');
   rule(actorId !== targetId, 'You cannot deactivate yourself.');
   const target = getUser(db, targetId);
   rule(target, 'No such member.');
+  rule(!target.is_owner, 'The owner cannot be deactivated.');
+  if (target.is_admin) rule(actor.is_owner, 'Only the owner can deactivate an admin.');
   if (active) rule(activeMemberCount(db) < MAX_MEMBERS, `The group is full (${MAX_MEMBERS} members).`);
   db.prepare('UPDATE users SET is_active = ?, session_version = session_version + 1 WHERE id = ?').run(
     active ? 1 : 0,
@@ -140,10 +147,35 @@ export function setPasswordHash(db: DB, userId: number, hash: string): void {
   db.prepare('UPDATE users SET password_hash = ?, session_version = session_version + 1 WHERE id = ?').run(hash, userId);
 }
 
+/**
+ * The owner makes another active member an admin, or takes that away, so no admin can remove the others and
+ * take over. The owner stays an admin.
+ */
+export function setAdmin(db: DB, actorId: number, targetId: number, admin: boolean): void {
+  const actor = getUser(db, actorId);
+  rule(actor?.is_owner && actor.is_active, 'Only the owner can appoint or remove admins.');
+  const target = getUser(db, targetId);
+  rule(target, 'No such member.');
+  rule(!target.is_owner, 'The owner is always an admin.');
+  if (admin) rule(target.is_active, 'Only active members can be made admins.');
+  db.prepare('UPDATE users SET is_admin = ? WHERE id = ?').run(admin ? 1 : 0, targetId);
+}
+
+/** Hands the group to another active member (from the server only). The previous owner stays an admin. */
+export function setOwner(db: DB, targetId: number): void {
+  const target = getUser(db, targetId);
+  rule(target?.is_active, 'Only an active member can be the owner.');
+  db.transaction(() => {
+    db.prepare('UPDATE users SET is_owner = 0 WHERE is_owner = 1').run();
+    db.prepare('UPDATE users SET is_owner = 1, is_admin = 1 WHERE id = ?').run(targetId);
+  })();
+}
+
 export interface MemberRow {
   id: number;
   display_name: string;
   is_admin: number;
+  is_owner: number;
   is_active: number;
   created_at: number;
   invited_by_name: string | null;
@@ -152,7 +184,7 @@ export interface MemberRow {
 export function listMembers(db: DB): MemberRow[] {
   return db
     .prepare(
-      `SELECT u.id, u.display_name, u.is_admin, u.is_active, u.created_at, i.display_name AS invited_by_name
+      `SELECT u.id, u.display_name, u.is_admin, u.is_owner, u.is_active, u.created_at, i.display_name AS invited_by_name
        FROM users u LEFT JOIN users i ON i.id = u.invited_by
        ORDER BY u.is_active DESC, u.display_name`,
     )
@@ -164,10 +196,16 @@ const hashToken = (token: string) => createHash('sha256').update(token).digest('
 /**
  * Admin-only. Returns a one-hour, single-use token for the member to set a new password.
  * It is shown once and only its hash is stored. Any earlier unused link for that member stops working.
+ * A reset link takes over an account, so only the owner can make one for an admin, and nobody can make one
+ * for the owner (whose password is reset with the reset-password command on the server).
  */
 export function createPasswordReset(db: DB, actorId: number, targetId: number, now: number): { token: string; expiresAt: number } {
-  rule(getUser(db, actorId)?.is_admin, 'Only the admin can do that.');
-  rule(getUser(db, targetId)?.is_active, 'No such active member.');
+  const actor = getUser(db, actorId);
+  rule(actor?.is_admin, 'Only an admin can do that.');
+  const target = getUser(db, targetId);
+  rule(target?.is_active, 'No such active member.');
+  rule(!target.is_owner, "The owner's password can only be reset on the server.");
+  if (target.is_admin) rule(actor.is_owner, "Only the owner can reset an admin's password.");
   const token = randomBytes(24).toString('base64url');
   db.transaction(() => {
     db.prepare('UPDATE password_resets SET used_at = ? WHERE user_id = ? AND used_at IS NULL').run(now, targetId);

@@ -10,17 +10,22 @@ import {
   cleanText,
   rule,
 } from './rules.ts';
+import { newPublicId } from '../ids.ts';
+import { isTimeZone } from '../time.ts';
 import { getUser } from './users.ts';
 
 export type MarketStatus = 'pending' | 'open' | 'closed' | 'proposed' | 'disputed' | 'resolved';
 
 export interface Market {
   id: number;
+  public_id: string;
+  old_number: number | null;
   creator_id: number;
   question: string;
   criteria: string;
   evidence_source: string;
   close_at: number;
+  timezone: string | null;
   subject_id: number | null;
   subject_opted_in_at: number | null;
   status: MarketStatus;
@@ -30,6 +35,8 @@ export interface Market {
   attestation: string;
   attested_at: number;
   created_at: number;
+  deleted_at: number | null;
+  deleted_by: number | null;
 }
 
 export interface MarketInput {
@@ -37,12 +44,25 @@ export interface MarketInput {
   criteria: string;
   evidenceSource: string;
   closeAt: number;
+  /** IANA zone the close time was typed in, and that the market shows its times in. */
+  timeZone: string;
   subjectId: number | null;
   attestations: string[];
 }
 
 export function requireActive(db: DB, userId: number): void {
   rule(getUser(db, userId)?.is_active, 'Your account is not active.');
+}
+
+/** The market's internal id, from the id in its URL, or NaN. */
+export function marketIdFromUrl(db: DB, urlId: string): number {
+  const row = db.prepare('SELECT id FROM markets WHERE public_id = ?').get(urlId) as { id: number } | undefined;
+  return row?.id ?? NaN;
+}
+
+/** The public id for a link that still uses a market's old number, if there is such a market. */
+export function publicIdForOldNumber(db: DB, n: number): string | undefined {
+  return (db.prepare('SELECT public_id FROM markets WHERE old_number = ?').get(n) as { public_id: string } | undefined)?.public_id;
 }
 
 export function getMarket(db: DB, id: number): Market {
@@ -56,6 +76,7 @@ export function createMarket(db: DB, creatorId: number, input: MarketInput, now:
   const question = cleanText(input.question, 'Question', 10, 200);
   const criteria = cleanText(input.criteria, 'Resolution criteria', 10, 1000);
   const evidence = cleanText(input.evidenceSource, 'Evidence source', 3, 300);
+  rule(isTimeZone(input.timeZone), 'Pick a time zone.');
   rule(Number.isFinite(input.closeAt), 'Pick a trading close time.');
   rule(input.closeAt >= now + MIN_CLOSE_DELAY, 'Trading must stay open for at least an hour.');
   rule(input.closeAt <= now + MAX_CLOSE_DELAY, 'Trading must close within a year.');
@@ -76,11 +97,11 @@ export function createMarket(db: DB, creatorId: number, input: MarketInput, now:
   const attestation = JSON.stringify(ATTESTATIONS.map((a) => a.text));
   const res = db
     .prepare(
-      `INSERT INTO markets (creator_id, question, criteria, evidence_source, close_at, subject_id,
+      `INSERT INTO markets (public_id, creator_id, question, criteria, evidence_source, close_at, timezone, subject_id,
          subject_opted_in_at, status, attestation, attested_at, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
-    .run(creatorId, question, criteria, evidence, input.closeAt, input.subjectId, optedInAt, status, attestation, now, now);
+    .run(newPublicId(), creatorId, question, criteria, evidence, input.closeAt, input.timeZone, input.subjectId, optedInAt, status, attestation, now, now);
   return Number(res.lastInsertRowid);
 }
 
@@ -173,7 +194,7 @@ export function listMarkets(db: DB, group: MarketGroup): MarketListRow[] {
   const g = LIST_GROUPS[group];
   const marks = g.statuses.map(() => '?').join(', ');
   return db
-    .prepare(`${LIST_SELECT} WHERE m.status IN (${marks}) ORDER BY ${g.order} LIMIT 200`)
+    .prepare(`${LIST_SELECT} WHERE m.status IN (${marks}) AND m.deleted_at IS NULL ORDER BY ${g.order} LIMIT 200`)
     .all(...g.statuses) as MarketListRow[];
 }
 
@@ -191,6 +212,7 @@ export function pendingOptIns(db: DB, userId: number): MarketListRow[] {
 
 export interface Position {
   id: number;
+  public_id: string;
   question: string;
   status: MarketStatus;
   outcome: Outcome | null;
@@ -202,7 +224,7 @@ export interface Position {
 export function positionsFor(db: DB, userId: number): Position[] {
   return db
     .prepare(
-      `SELECT m.id, m.question, m.status, m.outcome,
+      `SELECT m.id, m.public_id, m.question, m.status, m.outcome,
               SUM(CASE b.side WHEN 'YES' THEN b.amount ELSE 0 END) AS yes,
               SUM(CASE b.side WHEN 'NO' THEN b.amount ELSE 0 END) AS no,
               (SELECT COALESCE(SUM(amount), 0) FROM ledger WHERE user_id = ? AND market_id = m.id) AS net

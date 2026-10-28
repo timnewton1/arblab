@@ -24,7 +24,7 @@ src/domain/            points.ts, users.ts, markets.ts, payout.ts, resolution.ts
 src/views/             layout + page templates
 src/cli.ts             create-admin, reset-password, seed-demo
 public/style.css       < 200 lines
-public/app.js          local-time display; turns the close-time input into an exact instant
+public/app.js          time zone pickers + local-time display (the server reads the close time in the market's zone)
 test/*.test.ts         vitest
 ```
 

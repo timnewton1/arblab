@@ -16,8 +16,12 @@ if (secret.length < 32) {
   console.warn('SESSION_SECRET not set: using a random one, so sessions end when the server restarts.');
 }
 
+// Cookies are HTTPS-only in production; SECURE_COOKIES=false allows plain HTTP (e.g. a LAN-only container).
+const secureCookies = process.env.SECURE_COOKIES ? process.env.SECURE_COOKIES !== 'false' : production;
+if (production && !secureCookies) console.warn('SECURE_COOKIES=false: session cookies will be sent over plain HTTP.');
+
 const db = openDb(dbPath);
-const app = createApp({ db, secret, secureCookies: production, appUrl: process.env.APP_URL });
+const app = createApp({ db, secret, secureCookies, appUrl: process.env.APP_URL });
 
 // Deadlines are also checked before every request; this catches quiet periods and draws raffles promptly.
 const timer = setInterval(() => {

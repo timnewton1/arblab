@@ -12,11 +12,14 @@ import {
   type MarketGroup,
   betsFor,
   createMarket,
+  getMarket,
   getMarketRow,
   listMarkets,
+  marketIdFromUrl,
   pendingOptIns,
   placeBet,
   positionsFor,
+  publicIdForOldNumber,
   respondAsSubject,
   betList,
 } from './domain/markets.ts';
@@ -27,6 +30,8 @@ import {
   type Rng,
   bondFor,
   castVote,
+  deleteMarket,
+  deleteRefusal,
   dispute,
   disputesThisWeek,
   eligibleJurors,
@@ -51,6 +56,7 @@ import {
   redeemPasswordReset,
   revokeInvite,
   setActive,
+  setAdmin,
   setPasswordHash,
   usableInvite,
   usableReset,
@@ -58,7 +64,7 @@ import {
   validatePassword,
 } from './domain/users.ts';
 import { LoginLimiter } from './ratelimit.ts';
-import { DAY, seasonOf } from './time.ts';
+import { DAY, seasonOf, wallTimeToEpoch } from './time.ts';
 import {
   leaderboardPage,
   loginPage,
@@ -248,7 +254,7 @@ export function createApp(opts: AppOptions): Hono<Env> {
     return {
       now: c.get('now'),
       flash: f,
-      viewer: u ? { id: u.id, name: u.display_name, isAdmin: !!u.is_admin, balance: balanceOf(db, u.id) } : null,
+      viewer: u ? { id: u.id, name: u.display_name, isAdmin: !!u.is_admin, isOwner: !!u.is_owner, balance: balanceOf(db, u.id) } : null,
     };
   }
 
@@ -270,7 +276,9 @@ export function createApp(opts: AppOptions): Hono<Env> {
     return `${proto}://${c.req.header('host')}`;
   }
 
-  const marketId = (c: Context<Env>) => toInt(c.req.param('id') ?? '');
+  /** The market's internal id from the public id in its URL (NaN, so "No such market", if there's none). */
+  const marketId = (c: Context<Env>) => marketIdFromUrl(db, c.req.param('id') ?? '');
+  const backTo = (c: Context<Env>) => `/markets/${encodeURIComponent(c.req.param('id') ?? '')}`;
 
   // ---- login, invites, sign-up ----
 
@@ -386,8 +394,8 @@ export function createApp(opts: AppOptions): Hono<Env> {
     const group: MarketGroup = tab === 'awaiting' || tab === 'resolved' ? tab : 'open';
     const me = c.get('user')!.id;
     const todo: TodoItem[] = [
-      ...pendingOptIns(db, me).map((m) => ({ href: `/markets/${m.id}`, text: `Opt in or decline: ${m.question}` })),
-      ...juryDuty(db, me).map((m) => ({ href: `/markets/${m.id}`, text: `Jury duty: ${m.question}` })),
+      ...pendingOptIns(db, me).map((m) => ({ href: `/markets/${m.public_id}`, text: `Opt in or decline: ${m.question}` })),
+      ...juryDuty(db, me).map((m) => ({ href: `/markets/${m.public_id}`, text: `Jury duty: ${m.question}` })),
     ];
     return c.html(marketsPage(ctx(c), group, listMarkets(db, group), todo));
   });
@@ -401,11 +409,10 @@ export function createApp(opts: AppOptions): Hono<Env> {
       criteria: field(form, 'criteria'),
       evidence_source: field(form, 'evidence_source'),
       close_local: field(form, 'close_local'),
+      timezone: field(form, 'timezone'),
       subject_id: field(form, 'subject_id'),
     };
-    // app.js converts the local time to epoch ms; without JS the time is read as UTC.
-    const epoch = field(form, 'close_at_ms');
-    const closeAt = /^\d+$/.test(epoch) ? Number(epoch) : Date.parse(`${values.close_local}Z`);
+    const closeAt = wallTimeToEpoch(values.close_local, values.timezone);
     try {
       const id = db.transaction(() =>
         createMarket(
@@ -416,6 +423,7 @@ export function createApp(opts: AppOptions): Hono<Env> {
             criteria: values.criteria,
             evidenceSource: values.evidence_source,
             closeAt,
+            timeZone: values.timezone,
             subjectId: values.subject_id ? toInt(values.subject_id) : null,
             attestations: fieldList(form, 'attest'),
           },
@@ -423,7 +431,7 @@ export function createApp(opts: AppOptions): Hono<Env> {
         ),
       )();
       flash(c, 'ok', 'Market created.');
-      return c.redirect(`/markets/${id}`, 303);
+      return c.redirect(`/markets/${getMarket(db, id).public_id}`, 303);
     } catch (err) {
       if (!(err instanceof RuleError)) throw err;
       return c.html(newMarketPage(ctx(c, { kind: 'error', message: err.message }), listMembers(db), values), 400);
@@ -431,6 +439,9 @@ export function createApp(opts: AppOptions): Hono<Env> {
   });
 
   app.get('/markets/:id', (c) => {
+    // Links from before random ids used the market's number.
+    const old = /^\d{1,9}$/.test(c.req.param('id')) ? publicIdForOldNumber(db, Number(c.req.param('id'))) : undefined;
+    if (old) return c.redirect(`/markets/${old}`, 301);
     const id = marketId(c);
     const me = c.get('user')!.id;
     const now = c.get('now');
@@ -459,13 +470,15 @@ export function createApp(opts: AppOptions): Hono<Env> {
         jurors: getJurors(db, id).map((j) => ({ ...j, name: nameOf(j.user_id) })),
         disputesLeft: DISPUTES_PER_WEEK - disputesThisWeek(db, me, now),
         eligibleIfIDispute: eligibleJurors(db, id).filter((u) => u !== me).length,
+        canDelete: deleteRefusal(db, id, me) === null,
+        deletedBy: m.deleted_by === null ? null : nameOf(m.deleted_by),
         jurySize: jurySize(db),
       }),
     );
   });
 
   app.post('/markets/:id/bet', (c) =>
-    act(c, `/markets/${marketId(c)}`, (form, user, now) => {
+    act(c, backTo(c), (form, user, now) => {
       const side = parseSide(field(form, 'side'));
       const amount = toInt(field(form, 'amount'));
       placeBet(db, marketId(c), user.id, side, amount, now);
@@ -474,29 +487,37 @@ export function createApp(opts: AppOptions): Hono<Env> {
   );
 
   app.post('/markets/:id/subject', (c) =>
-    act(c, `/markets/${marketId(c)}`, (form, user, now) => {
+    act(c, backTo(c), (form, user, now) => {
       const accept = field(form, 'answer') === 'accept';
       respondAsSubject(db, marketId(c), user.id, accept, now);
       return accept ? 'You opted in. Betting is open.' : 'You declined. The market has been cancelled.';
     }),
   );
 
+  app.post('/markets/:id/delete', (c) =>
+    act(c, backTo(c), (form, user, now) => {
+      rule(field(form, 'confirm') === 'yes', 'Tick the box to confirm you want to delete this market.');
+      deleteMarket(db, marketId(c), user.id, now);
+      return 'Market deleted. Every stake was returned.';
+    }),
+  );
+
   app.post('/markets/:id/propose', (c) =>
-    act(c, `/markets/${marketId(c)}`, (form, user, now) => {
+    act(c, backTo(c), (form, user, now) => {
       propose(db, marketId(c), user.id, parseOutcome(field(form, 'outcome')), field(form, 'note'), now);
       return 'Outcome proposed. The 24-hour challenge window is open.';
     }),
   );
 
   app.post('/markets/:id/dispute', (c) =>
-    act(c, `/markets/${marketId(c)}`, (form, user, now) => {
+    act(c, backTo(c), (form, user, now) => {
       dispute(db, marketId(c), user.id, field(form, 'note'), now, opts.rng);
       return 'Dispute filed.';
     }),
   );
 
   app.post('/markets/:id/vote', (c) =>
-    act(c, `/markets/${marketId(c)}`, (form, user, now) => {
+    act(c, backTo(c), (form, user, now) => {
       castVote(db, marketId(c), user.id, parseOutcome(field(form, 'vote')), now);
       return 'Vote recorded.';
     }),
@@ -574,6 +595,17 @@ export function createApp(opts: AppOptions): Hono<Env> {
       return 'Invite revoked.';
     }),
   );
+
+  for (const action of ['make-admin', 'remove-admin'] as const) {
+    app.post(`/members/:id/${action}`, (c) =>
+      act(c, '/members', (_form, user) => {
+        const target = toInt(c.req.param('id') ?? '');
+        setAdmin(db, user.id, target, action === 'make-admin');
+        const name = getUser(db, target)!.display_name;
+        return action === 'make-admin' ? `${name} is now an admin.` : `${name} is no longer an admin.`;
+      }),
+    );
+  }
 
   for (const action of ['deactivate', 'reactivate'] as const) {
     app.post(`/members/:id/${action}`, (c) =>

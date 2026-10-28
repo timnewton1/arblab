@@ -1,0 +1,30 @@
+# docker compose up -d --build     then open http://localhost:8080
+# Settings come from .env next to this file (copy .env.example). Run exactly one replica:
+# the database is a single SQLite file on the arblab-data volume.
+services:
+  arblab:
+    build: .
+    image: arblab:latest
+    container_name: arblab
+    restart: unless-stopped
+    ports:
+      - "${ARBLAB_BIND:-127.0.0.1}:${ARBLAB_PORT:-8080}:8080"
+    environment:
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET in .env (openssl rand -hex 32)}
+      APP_URL: ${APP_URL:-}
+      SECURE_COOKIES: ${SECURE_COOKIES:-}
+    volumes:
+      - arblab-data:/data
+    # Hardening: nothing but /data and /tmp is writable, and the process gets no extra privileges.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 200
+    mem_limit: 512m
+
+volumes:
+  arblab-data:
